@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import configparser
 import ipaddress
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ BACKENDS = ("auto", "sendarp", "scapy")
 DEFAULT_CONFIG_TEXT = """; IP Activity Auditor 配置文件
 ; 相对路径以本配置文件所在目录为基准
 ; 仅允许扫描本文件中的 CIDR，请确保已获得网络扫描授权
+; 可填写多个网段，使用逗号、分号或换行分隔
 
 [scan]
 cidr = 192.168.0.0/24
@@ -38,11 +40,19 @@ log_dir = logs
 
 @dataclass(frozen=True)
 class ScanConfig:
-    cidr: str
-    network: ipaddress.IPv4Network
+    cidrs: tuple[str, ...]
+    networks: tuple[ipaddress.IPv4Network, ...]
     timeout_ms: int
     retries: int
     backend: str = "auto"
+
+    @property
+    def cidr(self) -> str:
+        return ", ".join(self.cidrs)
+
+    @property
+    def network(self) -> ipaddress.IPv4Network:
+        return self.networks[0]
 
 
 @dataclass(frozen=True)
@@ -106,6 +116,31 @@ def _resolve_path(value: str, base_dir: Path) -> Path:
     return path.resolve()
 
 
+def parse_cidrs(value: str) -> tuple[ipaddress.IPv4Network, ...]:
+    parts = [part for part in re.split(r"[,;\s]+", value.strip()) if part]
+    if not parts:
+        raise ConfigError("扫描网段不能为空")
+    networks: list[ipaddress.IPv4Network] = []
+    for part in parts:
+        try:
+            network = ipaddress.ip_network(part, strict=True)
+        except ValueError as exc:
+            raise ConfigError(
+                f"cidr 不是合法网段（不得包含主机位）：{part!r}"
+            ) from exc
+        if network.version != 4:
+            raise ConfigError(f"cidr 仅支持 IPv4：{part!r}")
+        if network in networks:
+            continue
+        for existing in networks:
+            if network.overlaps(existing):
+                raise ConfigError(
+                    f"扫描网段不能重叠：{existing} 与 {network}"
+                )
+        networks.append(network)
+    return tuple(networks)
+
+
 def write_default_config(path: str | Path, *, overwrite: bool = False) -> Path:
     config_path = Path(path).expanduser().resolve()
     if config_path.exists() and not overwrite:
@@ -129,13 +164,8 @@ def save_config(
 ) -> AppConfig:
     config_path = Path(path).expanduser().resolve()
 
-    cidr = cidr.strip()
-    try:
-        network = ipaddress.ip_network(cidr, strict=True)
-    except ValueError as exc:
-        raise ConfigError(f"cidr 不是合法网段（不得包含主机位）：{cidr!r}") from exc
-    if network.version != 4:
-        raise ConfigError(f"cidr 仅支持 IPv4：{cidr!r}")
+    networks = parse_cidrs(cidr)
+    cidr_text = ", ".join(str(network) for network in networks)
 
     backend = str(backend).strip().lower() or "auto"
     if backend not in BACKENDS:
@@ -170,7 +200,7 @@ def save_config(
 ; 最后保存时间：{datetime.now():%Y-%m-%d %H:%M:%S}
 
 [scan]
-cidr = {network}
+cidr = {cidr_text}
 backend = {backend}
 timeout_ms = {timeout}
 retries = {retry_count}
@@ -209,11 +239,9 @@ def load_config(path: str | Path) -> AppConfig:
 
     cidr = _required(parser, "scan", "cidr")
     try:
-        network = ipaddress.ip_network(cidr, strict=True)
-    except ValueError as exc:
-        raise ConfigError(f"[scan] cidr 不是合法网段（不得包含主机位）：{cidr!r}") from exc
-    if network.version != 4:
-        raise ConfigError(f"[scan] cidr 仅支持 IPv4：{cidr!r}")
+        networks = parse_cidrs(cidr)
+    except ConfigError as exc:
+        raise ConfigError(f"[scan] {exc}") from exc
 
     backend = parser.get("scan", "backend", fallback="auto").strip().lower() or "auto"
     if backend not in BACKENDS:
@@ -227,8 +255,8 @@ def load_config(path: str | Path) -> AppConfig:
     return AppConfig(
         path=config_path,
         scan=ScanConfig(
-            cidr=str(network),
-            network=network,
+            cidrs=tuple(str(network) for network in networks),
+            networks=networks,
             timeout_ms=timeout_ms,
             retries=retries,
             backend=backend,

@@ -4,6 +4,7 @@ import csv
 import ipaddress
 import locale
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -593,6 +594,7 @@ class IPActivityAuditorApp(ctk.CTk):
         self._build_inventory_page()
         self._build_history_page()
         self._build_reports_page()
+        self._build_logs_page()
         self._build_settings_page()
 
     def _build_sidebar(self) -> None:
@@ -652,6 +654,7 @@ class IPActivityAuditorApp(ctk.CTk):
             ("inventory", "IP 库存", "全部地址与活跃状态"),
             ("history", "扫描记录", "历次扫描审计轨迹"),
             ("reports", "报表中心", "未使用 IP 清单"),
+            ("logs", "日志", "运行日志查询"),
             ("settings", "设置", "参数与系统集成"),
         ]
         for index, (key, label, _hint) in enumerate(items):
@@ -1123,9 +1126,9 @@ class IPActivityAuditorApp(ctk.CTk):
         tree_holder.grid(row=0, column=0, sticky="nsew", padx=14, pady=(14, 0))
         self.inventory_tree = self._tree(
             tree_holder,
-            ["ip", "status", "last", "days", "first", "updated"],
-            ["IP 地址", "状态", "最后活跃", "未使用天数", "首次活跃", "更新时间"],
-            [150, 90, 120, 110, 120, 160],
+            ["ip", "status", "mac", "last", "days", "updated"],
+            ["IP 地址", "状态", "MAC 地址", "最后活跃", "未使用天数", "更新时间"],
+            [140, 90, 150, 120, 110, 160],
             height=8,
         )
         self.inventory_tree.tag_configure("online", foreground=C["green"])
@@ -1390,7 +1393,7 @@ class IPActivityAuditorApp(ctk.CTk):
 
         self.entries: dict[str, ctk.CTkEntry] = {}
         self.options: dict[str, ctk.CTkOptionMenu] = {}
-        self._field(form, "cidr", "扫描网段（CIDR）", 1, 0, 2)
+        self._cidr_field(form, 1)
         self._option_field(
             form,
             "backend",
@@ -1684,6 +1687,44 @@ class IPActivityAuditorApp(ctk.CTk):
         entry.grid(row=1, column=0, sticky="ew", pady=(5, 0))
         self.entries[key] = entry
 
+    def _cidr_field(self, master, row: int) -> None:
+        holder = ctk.CTkFrame(master, fg_color="transparent")
+        holder.grid(
+            row=row,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            padx=20,
+            pady=(10, 0),
+        )
+        holder.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            holder,
+            text="扫描网段（CIDR，可填写多个）",
+            font=_font(9, "bold"),
+            text_color=C["muted"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        self.cidr_textbox = ctk.CTkTextbox(
+            holder,
+            height=84,
+            corner_radius=9,
+            fg_color=C["surface"],
+            border_color=C["line"],
+            border_width=1,
+            text_color=C["text"],
+            font=_font(10),
+            wrap="none",
+        )
+        self.cidr_textbox.grid(row=1, column=0, sticky="ew", pady=(5, 0))
+        ctk.CTkLabel(
+            holder,
+            text="多个网段请用换行、逗号或分号分隔；网段之间不能重叠",
+            font=_font(9),
+            text_color=C["muted"],
+            anchor="w",
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+
     def _option_field(
         self,
         master,
@@ -1778,7 +1819,8 @@ class IPActivityAuditorApp(ctk.CTk):
             "dashboard": ("概览", "实时掌握内网 IP 活跃态势"),
             "inventory": ("IP 库存", "全部地址、在线状态与未使用天数"),
             "history": ("扫描记录", "历次扫描审计轨迹与每日在线趋势"),
-            "reports": ("报表中心", "生成、预览与打开未使用 IP 清单"),
+            "reports": ("报表中心", "生成、在软件内查看与打开未使用 IP 清单"),
+            "logs": ("日志", "查询运行、扫描与错误日志"),
             "settings": ("设置", "扫描参数、系统权限与每日任务"),
         }
         title, subtitle = titles[key]
@@ -1798,6 +1840,8 @@ class IPActivityAuditorApp(ctk.CTk):
         elif key == "reports":
             self.refresh_report_files()
             self._report_days_default()
+        elif key == "logs":
+            self.refresh_logs()
         elif key == "settings":
             self._populate_settings()
             self._refresh_system_settings()
@@ -1813,6 +1857,8 @@ class IPActivityAuditorApp(ctk.CTk):
             self.refresh_history()
         elif page == "reports":
             self.refresh_report_files()
+        elif page == "logs":
+            self.refresh_logs()
         elif page == "settings":
             self._refresh_system_settings()
         else:
@@ -1825,16 +1871,17 @@ class IPActivityAuditorApp(ctk.CTk):
         try:
             with Database(self.cfg.db_path) as db:
                 today = date.today()
-                snapshot["total"] = db.count_inventory(self.cfg.scan.cidr)
-                snapshot["online"] = db.count_online(self.cfg.scan.cidr)
+                cidrs = self.cfg.scan.cidrs
+                snapshot["total"] = db.count_inventory(cidrs)
+                snapshot["online"] = db.count_online(cidrs)
                 snapshot["days"] = {
-                    day: len(db.fetch_unused(self.cfg.scan.cidr, today, day))
+                    day: len(db.fetch_unused(cidrs, today, day))
                     for day in self.cfg.unused_days
                 }
-                snapshot["last"] = db.last_scan(self.cfg.scan.cidr)
-                snapshot["recent"] = db.recent_scans(self.cfg.scan.cidr, 6)
-                snapshot["stats"] = db.scan_stats(self.cfg.scan.cidr)
-                snapshot["last_success"] = db.last_success_date(self.cfg.scan.cidr)
+                snapshot["last"] = db.last_scan()
+                snapshot["recent"] = db.recent_scans(6)
+                snapshot["stats"] = db.scan_stats()
+                snapshot["last_success"] = db.last_success_date()
                 start = today - timedelta(days=13)
                 counts = dict(db.daily_online_counts(start, today))
                 snapshot["daily"] = [
@@ -1867,7 +1914,14 @@ class IPActivityAuditorApp(ctk.CTk):
         cfg_days = list(self.cfg.unused_days) if self.cfg else [7, 15]
         first_day = cfg_days[0]
         second_day = cfg_days[1] if len(cfg_days) > 1 else cfg_days[0]
-        self.stat_total.set_value(str(total), self.cfg.scan.cidr if self.cfg else "")
+        total_hint = ""
+        if self.cfg:
+            total_hint = (
+                self.cfg.scan.cidr
+                if len(self.cfg.scan.cidrs) == 1
+                else f"{len(self.cfg.scan.cidrs)} 个网段"
+            )
+        self.stat_total.set_value(str(total), total_hint)
         last = snapshot["last"]
         if last is not None:
             last_status = str(last["status"])
@@ -1893,7 +1947,7 @@ class IPActivityAuditorApp(ctk.CTk):
             with Database(self.cfg.db_path) as db:
                 never = sum(
                     1
-                    for row in db.fetch_inventory(self.cfg.scan.cidr)
+                    for row in db.fetch_inventory(self.cfg.scan.cidrs)
                     if not row["last_seen_date"]
                 )
         except Exception:
@@ -1975,7 +2029,7 @@ class IPActivityAuditorApp(ctk.CTk):
             return
         try:
             with Database(self.cfg.db_path) as db:
-                rows = db.fetch_inventory(self.cfg.scan.cidr)
+                rows = db.fetch_inventory(self.cfg.scan.cidrs)
         except Exception as exc:
             self.logger.exception("读取库存失败")
             self.toast(f"读取库存失败：{exc}", "error")
@@ -2004,6 +2058,7 @@ class IPActivityAuditorApp(ctk.CTk):
                     "status_text": status_text,
                     "last": last_seen or "—",
                     "days": days_unused,
+                    "mac": row["mac_address"] or "—",
                     "first": row["first_seen_date"] or "—",
                     "updated": row["updated_at"] or "—",
                 }
@@ -2030,8 +2085,10 @@ class IPActivityAuditorApp(ctk.CTk):
         selected = self.filter_segment.get()
         shown = 0
         for row in self._inventory_rows:
-            if query and query not in str(row["ip"]).lower():
-                continue
+            if query:
+                haystack = f"{row['ip']} {row['mac']}".lower()
+                if query not in haystack:
+                    continue
             status = str(row["status"])
             if selected == "在线" and status != "online":
                 continue
@@ -2045,9 +2102,9 @@ class IPActivityAuditorApp(ctk.CTk):
                 values=(
                     row["ip"],
                     row["status_text"],
+                    row["mac"],
                     row["last"],
                     row["days"],
-                    row["first"],
                     row["updated"],
                 ),
                 tags=(status,),
@@ -2141,7 +2198,7 @@ class IPActivityAuditorApp(ctk.CTk):
             ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 7))
             ctk.CTkButton(
                 row,
-                text="预览",
+                text="查看",
                 width=52,
                 height=26,
                 corner_radius=7,
@@ -2166,18 +2223,25 @@ class IPActivityAuditorApp(ctk.CTk):
                 command=lambda target=path: self.open_file(target),
             ).grid(row=0, column=2, rowspan=2, padx=(0, 10))
             row.bind("<Double-Button-1>", lambda _event, target=path: self.preview_report(target))
+        if self._preview_path is None or not self._preview_path.exists():
+            self.preview_report(files[0])
 
     def _clear_preview(self) -> None:
         self.preview_title.configure(text="未选择报表")
-        self.preview_meta.configure(text="从左侧选择报表查看前 200 行")
+        self.preview_meta.configure(text="从左侧选择报表即可在软件内查看")
         for item in self.preview_tree.get_children():
             self.preview_tree.delete(item)
-        self.preview_tree.configure(
-            columns=["c0", "c1", "c2", "c3"], displaycolumns=["c0", "c1", "c2", "c3"]
-        )
-        for index, heading in enumerate(
-            ["ip_address", "last_seen_date", "days_unused", "status"]
-        ):
+        headings = [
+            "ip_address",
+            "last_seen_date",
+            "days_unused",
+            "mac_address",
+            "never_active",
+            "status",
+        ]
+        columns = [f"c{index}" for index in range(len(headings))]
+        self.preview_tree.configure(columns=columns, displaycolumns=columns)
+        for index, heading in enumerate(headings):
             column = f"c{index}"
             self.preview_tree.heading(column, text=heading)
 
@@ -2188,14 +2252,19 @@ class IPActivityAuditorApp(ctk.CTk):
             with path.open("r", encoding="utf-8-sig", newline="") as handle:
                 reader = csv.reader(handle)
                 header = next(reader, [])
-                rows = []
-                for index, row in enumerate(reader):
-                    if index >= 200:
-                        break
-                    rows.append(row)
+                all_rows = [row for row in reader]
         except Exception as exc:
             self.preview_meta.configure(text=f"无法读取：{exc}")
             return
+        rows = all_rows[:200]
+        never_count = 0
+        if "never_active" in header:
+            index = header.index("never_active")
+            never_count = sum(
+                1
+                for row in all_rows
+                if len(row) > index and row[index] == "是"
+            )
         column_count = max(len(header), 1)
         columns = [f"c{index}" for index in range(column_count)]
         self.preview_tree.configure(columns=columns, displaycolumns=columns)
@@ -2209,13 +2278,170 @@ class IPActivityAuditorApp(ctk.CTk):
         for row in rows:
             padded = list(row) + [""] * (column_count - len(row))
             self.preview_tree.insert("", "end", values=padded[:column_count])
-        self.preview_meta.configure(text=f"显示 {len(rows)} 行 · 文件编码 UTF-8-BOM")
+        self.preview_meta.configure(
+            text=(
+                f"共 {len(all_rows)} 条 · 从未活跃 {never_count} 条 · "
+                f"当前显示 {len(rows)} 行 · UTF-8-BOM"
+            )
+        )
 
     def open_preview_file(self) -> None:
         if self._preview_path and self._preview_path.exists():
             self.open_file(self._preview_path)
         else:
             self.toast("请先选择一份报表", "info")
+
+    # --------------------------------------------------------------------- logs
+
+    def _build_logs_page(self) -> None:
+        page = ctk.CTkFrame(self.container, fg_color=C["bg"], corner_radius=0)
+        page.grid(row=0, column=0, sticky="nsew")
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(1, weight=1)
+        self._pages["logs"] = page
+
+        toolbar = ctk.CTkFrame(page, fg_color="transparent")
+        toolbar.grid(row=0, column=0, sticky="ew", padx=28, pady=(18, 12))
+        toolbar.grid_columnconfigure(1, weight=1)
+
+        self.log_search_entry = ctk.CTkEntry(
+            toolbar,
+            width=300,
+            height=42,
+            corner_radius=10,
+            fg_color=C["card"],
+            border_color=C["line"],
+            border_width=1,
+            placeholder_text="搜索日志内容…",
+            placeholder_text_color=C["muted"],
+            text_color=C["text"],
+            font=_font(10),
+        )
+        self.log_search_entry.grid(row=0, column=0, sticky="w")
+        self.log_search_entry.bind("<KeyRelease>", lambda _event: self.refresh_logs())
+
+        self.log_level_segment = ctk.CTkSegmentedButton(
+            toolbar,
+            values=["全部", "INFO", "WARNING", "ERROR"],
+            width=300,
+            height=42,
+            corner_radius=10,
+            fg_color=C["card"],
+            selected_color=C["accent"],
+            selected_hover_color=C["accent_hover"],
+            unselected_color=C["card"],
+            unselected_hover_color=C["card_hover"],
+            text_color=C["text"],
+            font=_font(10),
+            command=lambda _value: self.refresh_logs(),
+        )
+        self.log_level_segment.set("全部")
+        self.log_level_segment.grid(row=0, column=2, sticky="e", padx=(0, 8))
+
+        ctk.CTkButton(
+            toolbar,
+            text="刷新",
+            width=72,
+            height=42,
+            corner_radius=10,
+            fg_color="transparent",
+            border_width=1,
+            border_color=C["line"],
+            hover_color=C["card_hover"],
+            text_color=C["text_soft"],
+            font=_font(10),
+            command=self.refresh_logs,
+        ).grid(row=0, column=3, padx=(0, 8))
+
+        ctk.CTkButton(
+            toolbar,
+            text="打开日志目录",
+            width=116,
+            height=42,
+            corner_radius=10,
+            fg_color=C["accent"],
+            hover_color=C["accent_hover"],
+            text_color="#FFFFFF",
+            font=_font(10, "bold"),
+            command=self.open_log_dir,
+        ).grid(row=0, column=4)
+
+        card = self._card(page)
+        card.grid(row=1, column=0, sticky="nsew", padx=28, pady=(0, 26))
+        card.grid_rowconfigure(0, weight=1)
+        card.grid_columnconfigure(0, weight=1)
+        holder = ctk.CTkFrame(card, fg_color="transparent")
+        holder.grid(row=0, column=0, sticky="nsew", padx=14, pady=(14, 0))
+        self.log_tree = self._tree(
+            holder,
+            ["time", "level", "message"],
+            ["时间", "级别", "内容"],
+            [170, 110, 600],
+            height=10,
+        )
+        self.log_tree.tag_configure("ERROR", foreground=C["red"])
+        self.log_tree.tag_configure("WARNING", foreground=C["amber"])
+        self.log_tree.tag_configure("INFO", foreground=C["text_soft"])
+        footer = ctk.CTkFrame(card, fg_color="transparent")
+        footer.grid(row=1, column=0, sticky="ew", padx=20, pady=(8, 12))
+        self.log_count = ctk.CTkLabel(
+            footer,
+            text="尚未读取日志",
+            font=_font(9),
+            text_color=C["muted"],
+            anchor="w",
+        )
+        self.log_count.pack(side="left")
+
+    def refresh_logs(self) -> None:
+        if not hasattr(self, "log_tree"):
+            return
+        tree = self.log_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        if not self.cfg:
+            self.log_count.configure(text="配置不可用，无法读取日志")
+            return
+        log_path = self.cfg.log_dir / "ip_activity_auditor.log"
+        lines: list[str] = []
+        if log_path.exists():
+            try:
+                with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+                    lines = handle.readlines()[-2000:]
+            except Exception as exc:
+                self.log_count.configure(text=f"读取日志失败：{exc}")
+                return
+        else:
+            self.log_count.configure(text=f"日志文件不存在：{log_path}")
+            return
+
+        pattern = re.compile(
+            r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(\w+)\] (.*)$"
+        )
+        level_filter = self.log_level_segment.get()
+        query = self.log_search_entry.get().strip().lower()
+        shown = 0
+        for line in reversed(lines):
+            text = line.rstrip("\r\n")
+            match = pattern.match(text)
+            if match:
+                timestamp, level, message = match.groups()
+            else:
+                timestamp, level, message = "", "INFO", text
+            if level_filter != "全部" and level != level_filter:
+                continue
+            if query and query not in text.lower():
+                continue
+            tree.insert(
+                "",
+                "end",
+                values=(timestamp, level, message),
+                tags=(level,),
+            )
+            shown += 1
+        self.log_count.configure(
+            text=f"最近 {len(lines)} 行 · 当前显示 {shown} 条 · {log_path}"
+        )
 
     # ------------------------------------------------------------------ workers
 
@@ -2322,8 +2548,10 @@ class IPActivityAuditorApp(ctk.CTk):
         )
         try:
             db = Database(cfg.db_path)
-            addresses = (str(ip) for ip in cfg.scan.network.hosts())
-            db.initialize_inventory(cfg.scan.cidr, addresses)
+            for network in cfg.scan.networks:
+                db.initialize_inventory(
+                    str(network), (str(ip) for ip in network.hosts())
+                )
             try:
                 result = scan(cfg.scan)
             except ScanError as exc:
@@ -2341,11 +2569,24 @@ class IPActivityAuditorApp(ctk.CTk):
                     )
                 )
                 return
-            db.apply_scan_success(
-                cidr=cfg.scan.cidr,
+            groups: list[tuple[str, list[str]]] = []
+            for network in cfg.scan.networks:
+                groups.append(
+                    (
+                        str(network),
+                        [
+                            ip
+                            for ip in result.online_ips
+                            if ipaddress.ip_address(ip) in network
+                        ],
+                    )
+                )
+            db.apply_scan_success_multi(
+                groups=groups,
+                cidr_label=cfg.scan.cidr,
                 scan_date=date.today().isoformat(),
-                online_ips=result.online_ips,
                 duration_ms=result.duration_ms,
+                mac_map=result.mac_map,
             )
             scan_succeeded = True
             report_files: list[tuple[Path, int]] = []
@@ -2355,7 +2596,7 @@ class IPActivityAuditorApp(ctk.CTk):
                     report_files = generate_reports(
                         db,
                         cfg.report_dir,
-                        cfg.scan.cidr,
+                        cfg.scan.cidrs,
                         date.today(),
                         cfg.unused_days,
                     )
@@ -2370,7 +2611,8 @@ class IPActivityAuditorApp(ctk.CTk):
                 result.duration_ms,
             )
             message = (
-                f"扫描完成（{backend_label}）：在线 {len(result.online_ips)} 个 IP，"
+                f"扫描完成（{backend_label}，{len(cfg.scan.cidrs)} 个网段）："
+                f"在线 {len(result.online_ips)} 个 IP，"
                 f"耗时 {_format_duration(result.duration_ms)}"
             )
             if report_error:
@@ -2419,9 +2661,12 @@ class IPActivityAuditorApp(ctk.CTk):
         db: Database | None = None
         try:
             db = Database(cfg.db_path)
-            addresses = (str(ip) for ip in cfg.scan.network.hosts())
-            inserted = db.initialize_inventory(cfg.scan.cidr, addresses)
-            total = db.count_inventory(cfg.scan.cidr)
+            inserted = 0
+            for network in cfg.scan.networks:
+                inserted += db.initialize_inventory(
+                    str(network), (str(ip) for ip in network.hosts())
+                )
+            total = db.count_inventory(cfg.scan.cidrs)
             self.logger.info("GUI 初始化库存：%s，新增 %d，总计 %d", cfg.scan.cidr, inserted, total)
             self._post(
                 lambda: self._finish_action(
@@ -2467,7 +2712,7 @@ class IPActivityAuditorApp(ctk.CTk):
         db: Database | None = None
         try:
             db = Database(cfg.db_path)
-            if db.count_inventory(cfg.scan.cidr) == 0:
+            if db.count_inventory(cfg.scan.cidrs) == 0:
                 self._post(
                     lambda: self._finish_action(
                         False, "库存为空，请先执行扫描或初始化库存", error=True
@@ -2475,7 +2720,7 @@ class IPActivityAuditorApp(ctk.CTk):
                 )
                 return
             files = generate_reports(
-                db, cfg.report_dir, cfg.scan.cidr, date.today(), days
+                db, cfg.report_dir, cfg.scan.cidrs, date.today(), days
             )
             self.logger.info("GUI 生成报表：%s", files)
             self._post(
@@ -2535,13 +2780,22 @@ class IPActivityAuditorApp(ctk.CTk):
             with output.open("w", encoding="utf-8-sig", newline="") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(
-                    ["ip_address", "status", "last_seen_date", "days_unused", "first_seen_date", "updated_at"]
+                    [
+                        "ip_address",
+                        "status",
+                        "mac_address",
+                        "last_seen_date",
+                        "days_unused",
+                        "first_seen_date",
+                        "updated_at",
+                    ]
                 )
                 for row in self._inventory_rows:
                     writer.writerow(
                         [
                             row["ip"],
                             row["status_text"],
+                            row["mac"],
                             row["last"],
                             row["days"],
                             row["first"],
@@ -2573,7 +2827,7 @@ class IPActivityAuditorApp(ctk.CTk):
         }
         if self.cfg:
             values = {
-                "cidr": self.cfg.scan.cidr,
+                "cidr": "\n".join(self.cfg.scan.cidrs),
                 "backend": self.cfg.scan.backend,
                 "timeout_ms": str(self.cfg.scan.timeout_ms),
                 "retries": str(self.cfg.scan.retries),
@@ -2585,6 +2839,8 @@ class IPActivityAuditorApp(ctk.CTk):
         for key, entry in self.entries.items():
             entry.delete(0, "end")
             entry.insert(0, values.get(key, ""))
+        self.cidr_textbox.delete("1.0", "end")
+        self.cidr_textbox.insert("1.0", values.get("cidr", ""))
         backend_menu = self.options.get("backend")
         if backend_menu is not None:
             backend_menu.set(BACKEND_LABELS.get(values["backend"], "自动（推荐）"))
@@ -2661,6 +2917,7 @@ class IPActivityAuditorApp(ctk.CTk):
 
     def save_settings(self) -> None:
         values = {key: entry.get().strip() for key, entry in self.entries.items()}
+        cidr_text = self.cidr_textbox.get("1.0", "end-1c").strip()
         backend_menu = self.options.get("backend")
         backend = (
             BACKEND_OPTIONS.get(backend_menu.get(), "auto")
@@ -2670,7 +2927,7 @@ class IPActivityAuditorApp(ctk.CTk):
         try:
             cfg = save_config(
                 self.config_path,
-                cidr=values["cidr"],
+                cidr=cidr_text,
                 timeout_ms=values["timeout_ms"],
                 retries=values["retries"],
                 db_path=values["db_path"],

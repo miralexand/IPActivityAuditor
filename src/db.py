@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS ip_inventory (
     first_seen_date TEXT,
     last_seen_date TEXT,
     last_status TEXT,
+    mac_address TEXT,
     updated_at TEXT
 );
 
@@ -39,15 +40,26 @@ CREATE TABLE IF NOT EXISTS daily_online (
 
 _ONLINE_UPSERT = """
 INSERT INTO ip_inventory (
-    ip_address, cidr, first_seen_date, last_seen_date, last_status, updated_at
-) VALUES (?, ?, ?, ?, 'online', ?)
+    ip_address, cidr, first_seen_date, last_seen_date, last_status, mac_address, updated_at
+) VALUES (?, ?, ?, ?, 'online', ?, ?)
 ON CONFLICT(ip_address) DO UPDATE SET
     cidr = excluded.cidr,
     last_seen_date = excluded.last_seen_date,
     first_seen_date = COALESCE(ip_inventory.first_seen_date, excluded.first_seen_date),
     last_status = 'online',
+    mac_address = COALESCE(excluded.mac_address, ip_inventory.mac_address),
     updated_at = excluded.updated_at
 """
+
+
+def _cidr_list(cidrs: str | Sequence[str]) -> list[str]:
+    if isinstance(cidrs, str):
+        return [cidrs]
+    return [str(cidr) for cidr in cidrs]
+
+
+def _placeholders(values: Sequence[object]) -> str:
+    return ",".join("?" for _ in values)
 
 
 def _now_text() -> str:
@@ -76,6 +88,14 @@ class Database:
     def init_schema(self) -> None:
         with self.conn:
             self.conn.executescript(SCHEMA)
+            columns = {
+                str(row["name"])
+                for row in self.conn.execute("PRAGMA table_info(ip_inventory)")
+            }
+            if "mac_address" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE ip_inventory ADD COLUMN mac_address TEXT"
+                )
 
     def initialize_inventory(
         self,
@@ -106,32 +126,70 @@ class Database:
         online_ips: Sequence[str],
         duration_ms: int,
         scanned_at: str | None = None,
+        mac_map: dict[str, str] | None = None,
+    ) -> None:
+        self.apply_scan_success_multi(
+            groups=[(cidr, online_ips)],
+            cidr_label=cidr,
+            scan_date=scan_date,
+            duration_ms=duration_ms,
+            scanned_at=scanned_at,
+            mac_map=mac_map,
+        )
+
+    def apply_scan_success_multi(
+        self,
+        *,
+        groups: Sequence[tuple[str, Sequence[str]]],
+        cidr_label: str,
+        scan_date: str,
+        duration_ms: int,
+        scanned_at: str | None = None,
+        mac_map: dict[str, str] | None = None,
     ) -> None:
         scanned_at = scanned_at or _now_text()
-        online = sorted(set(online_ips))
+        mac_map = mac_map or {}
+        normalized: list[tuple[str, list[str]]] = []
+        all_online: set[str] = set()
+        for cidr, ips in groups:
+            addresses = sorted(set(str(ip) for ip in ips))
+            normalized.append((cidr, addresses))
+            all_online.update(addresses)
+
         with self.conn:
-            self.conn.execute(
-                """
-                UPDATE ip_inventory
-                SET last_status = 'offline', updated_at = ?
-                WHERE cidr = ? AND (last_status IS NULL OR last_status <> 'offline')
-                """,
-                (scanned_at, cidr),
-            )
-            self.conn.executemany(
-                _ONLINE_UPSERT,
-                [(ip, cidr, scan_date, scan_date, scanned_at) for ip in online],
-            )
+            for cidr, addresses in normalized:
+                self.conn.execute(
+                    """
+                    UPDATE ip_inventory
+                    SET last_status = 'offline', updated_at = ?
+                    WHERE cidr = ? AND (last_status IS NULL OR last_status <> 'offline')
+                    """,
+                    (scanned_at, cidr),
+                )
+                self.conn.executemany(
+                    _ONLINE_UPSERT,
+                    [
+                        (
+                            ip,
+                            cidr,
+                            scan_date,
+                            scan_date,
+                            mac_map.get(ip),
+                            scanned_at,
+                        )
+                        for ip in addresses
+                    ],
+                )
             self.conn.executemany(
                 "INSERT OR REPLACE INTO daily_online (scan_date, ip_address, scanned_at) VALUES (?, ?, ?)",
-                [(scan_date, ip, scanned_at) for ip in online],
+                [(scan_date, ip, scanned_at) for ip in sorted(all_online)],
             )
             self.conn.execute(
                 """
                 INSERT INTO scan_runs (scan_date, cidr, online_count, duration_ms, status, error)
                 VALUES (?, ?, ?, ?, 'success', NULL)
                 """,
-                (scan_date, cidr, len(online), duration_ms),
+                (scan_date, cidr_label, len(all_online), duration_ms),
             )
 
     def record_failed_run(
@@ -151,84 +209,88 @@ class Database:
                 (scan_date, cidr, duration_ms, (error or "")[:_MAX_ERROR_LEN]),
             )
 
-    def fetch_unused(self, cidr: str, scan_date: date, days: int) -> list[sqlite3.Row]:
+    def fetch_unused(
+        self,
+        cidrs: str | Sequence[str],
+        scan_date: date,
+        days: int,
+    ) -> list[sqlite3.Row]:
+        cidr_list = _cidr_list(cidrs)
+        if not cidr_list:
+            return []
         cutoff = (scan_date - timedelta(days=days)).isoformat()
         cursor = self.conn.execute(
-            """
-            SELECT ip_address, last_seen_date
+            f"""
+            SELECT ip_address, last_seen_date, mac_address
             FROM ip_inventory
-            WHERE cidr = ? AND (last_seen_date IS NULL OR last_seen_date <= ?)
+            WHERE cidr IN ({_placeholders(cidr_list)})
+              AND (last_seen_date IS NULL OR last_seen_date <= ?)
             ORDER BY ip_address
             """,
-            (cidr, cutoff),
+            (*cidr_list, cutoff),
         )
         return cursor.fetchall()
 
-    def fetch_inventory(self, cidr: str) -> list[sqlite3.Row]:
+    def fetch_inventory(self, cidrs: str | Sequence[str]) -> list[sqlite3.Row]:
+        cidr_list = _cidr_list(cidrs)
+        if not cidr_list:
+            return []
         cursor = self.conn.execute(
-            """
-            SELECT ip_address, cidr, first_seen_date, last_seen_date, last_status, updated_at
+            f"""
+            SELECT ip_address, cidr, first_seen_date, last_seen_date,
+                   last_status, mac_address, updated_at
             FROM ip_inventory
-            WHERE cidr = ?
+            WHERE cidr IN ({_placeholders(cidr_list)})
             ORDER BY ip_address
             """,
-            (cidr,),
+            cidr_list,
         )
         return cursor.fetchall()
 
-    def count_inventory(self, cidr: str) -> int:
+    def count_inventory(self, cidrs: str | Sequence[str]) -> int:
+        cidr_list = _cidr_list(cidrs)
+        if not cidr_list:
+            return 0
         cursor = self.conn.execute(
-            "SELECT COUNT(*) FROM ip_inventory WHERE cidr = ?", (cidr,)
+            f"SELECT COUNT(*) FROM ip_inventory WHERE cidr IN ({_placeholders(cidr_list)})",
+            cidr_list,
         )
         return int(cursor.fetchone()[0])
 
-    def count_online(self, cidr: str) -> int:
+    def count_online(self, cidrs: str | Sequence[str]) -> int:
+        cidr_list = _cidr_list(cidrs)
+        if not cidr_list:
+            return 0
         cursor = self.conn.execute(
-            "SELECT COUNT(*) FROM ip_inventory WHERE cidr = ? AND last_status = 'online'",
-            (cidr,),
+            f"SELECT COUNT(*) FROM ip_inventory WHERE cidr IN ({_placeholders(cidr_list)}) "
+            "AND last_status = 'online'",
+            cidr_list,
         )
         return int(cursor.fetchone()[0])
 
-    def recent_scans(
-        self, cidr: str | None = None, limit: int = 50
-    ) -> list[sqlite3.Row]:
-        sql = "SELECT * FROM scan_runs"
-        params: list[object] = []
-        if cidr:
-            sql += " WHERE cidr = ?"
-            params.append(cidr)
-        sql += " ORDER BY id DESC LIMIT ?"
-        params.append(max(int(limit), 1))
-        return self.conn.execute(sql, params).fetchall()
+    def recent_scans(self, limit: int = 50) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM scan_runs ORDER BY id DESC LIMIT ?",
+            (max(int(limit), 1),),
+        ).fetchall()
 
-    def last_scan(self, cidr: str | None = None) -> sqlite3.Row | None:
-        rows = self.recent_scans(cidr=cidr, limit=1)
+    def last_scan(self) -> sqlite3.Row | None:
+        rows = self.recent_scans(limit=1)
         return rows[0] if rows else None
 
-    def last_success_date(self, cidr: str | None = None) -> str | None:
-        if cidr:
-            row = self.conn.execute(
-                "SELECT scan_date FROM scan_runs WHERE status = 'success' AND cidr = ? "
-                "ORDER BY id DESC LIMIT 1",
-                (cidr,),
-            ).fetchone()
-        else:
-            row = self.conn.execute(
-                "SELECT scan_date FROM scan_runs WHERE status = 'success' "
-                "ORDER BY id DESC LIMIT 1"
-            ).fetchone()
+    def last_success_date(self) -> str | None:
+        row = self.conn.execute(
+            "SELECT scan_date FROM scan_runs WHERE status = 'success' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
         return str(row["scan_date"]) if row else None
 
-    def scan_stats(self, cidr: str | None = None) -> tuple[int, int, int]:
-        sql = "SELECT status, COUNT(*) AS amount FROM scan_runs"
-        params: tuple[object, ...] = ()
-        if cidr:
-            sql += " WHERE cidr = ?"
-            params = (cidr,)
-        sql += " GROUP BY status"
+    def scan_stats(self) -> tuple[int, int, int]:
         counts = {
             str(row["status"]): int(row["amount"])
-            for row in self.conn.execute(sql, params).fetchall()
+            for row in self.conn.execute(
+                "SELECT status, COUNT(*) AS amount FROM scan_runs GROUP BY status"
+            ).fetchall()
         }
         success = counts.get("success", 0)
         failed = counts.get("failed", 0)

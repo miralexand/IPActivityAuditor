@@ -9,7 +9,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from config import ScanConfig
@@ -25,6 +25,7 @@ class ScanResult:
     duration_ms: int
     iface: str
     backend: str = "scapy"
+    mac_map: dict[str, str] = field(default_factory=dict)
 
 
 _SENDARP = None
@@ -146,19 +147,111 @@ def _route_source_ip(network: ipaddress.IPv4Network) -> str:
         sock.close()
 
 
-def _ensure_local_source(network: ipaddress.IPv4Network, source_ip: str) -> None:
+class _MIB_IPADDRROW(ctypes.Structure):
+    _fields_ = [
+        ("dwAddr", wintypes.DWORD),
+        ("dwIndex", wintypes.DWORD),
+        ("dwMask", wintypes.DWORD),
+        ("dwBCastAddr", wintypes.DWORD),
+        ("dwReasmSize", wintypes.DWORD),
+        ("unused1", wintypes.USHORT),
+        ("wType", wintypes.USHORT),
+    ]
+
+
+def _dword_to_ip(value: int) -> str:
+    return socket.inet_ntoa(struct.pack("<I", value))
+
+
+def _local_ipv4_networks() -> list[ipaddress.IPv4Network]:
+    if sys.platform != "win32":
+        return []
     try:
-        source_in_network = ipaddress.ip_address(source_ip) in network
-    except ValueError:
-        source_in_network = False
-    if not source_in_network:
-        raise ScanError(
-            f"本机没有位于 {network} 网段的地址（路由选中的源地址为 {source_ip}），"
-            "无法执行 ARP 扫描，请检查网卡与配置"
+        iphlpapi = ctypes.windll.iphlpapi
+        size = wintypes.ULONG(0)
+        result = iphlpapi.GetIpAddrTable(None, ctypes.byref(size), False)
+        if int(result) not in (0, 122):
+            return []
+        if size.value == 0:
+            return []
+        buffer = ctypes.create_string_buffer(size.value)
+        result = iphlpapi.GetIpAddrTable(
+            ctypes.byref(buffer), ctypes.byref(size), False
         )
+        if int(result) != 0:
+            return []
+        count = ctypes.cast(buffer, ctypes.POINTER(wintypes.DWORD)).contents.value
+        rows = (_MIB_IPADDRROW * count).from_buffer(buffer, ctypes.sizeof(wintypes.DWORD))
+        networks: list[ipaddress.IPv4Network] = []
+        for row in rows:
+            if not row.dwAddr or not row.dwMask:
+                continue
+            try:
+                network = ipaddress.IPv4Network(
+                    f"{_dword_to_ip(row.dwAddr)}/{_dword_to_ip(row.dwMask)}",
+                    strict=False,
+                )
+            except ValueError:
+                continue
+            if network not in networks:
+                networks.append(network)
+        return networks
+    except Exception:
+        return []
 
 
-def _probe_sendarp(function, value: int, retries: int) -> tuple[bool, int]:
+def _ensure_local_source(
+    network: ipaddress.IPv4Network,
+    source_ip: str,
+    local_networks: list[ipaddress.IPv4Network] | None = None,
+) -> None:
+    try:
+        source_address = ipaddress.ip_address(source_ip)
+    except ValueError:
+        source_address = None
+    if local_networks and source_address is not None:
+        for local_network in local_networks:
+            if (
+                source_address in local_network
+                and network.subnet_of(local_network)
+            ):
+                return
+    elif source_address is not None and source_address in network:
+        return
+    raise ScanError(
+        f"网段 {network} 不在本机可直达的二层网段内"
+        f"（路由选中的源地址为 {source_ip}），无法执行 ARP 扫描。"
+        "请检查网卡与配置；子网可配置其所在的本机大网段。"
+    )
+
+
+def _format_mac(raw) -> str | None:
+    try:
+        values = list(raw)[:6]
+    except TypeError:
+        return None
+    if len(values) < 6 or not any(values):
+        return None
+    try:
+        return ":".join(f"{int(value) & 0xFF:02X}" for value in values)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_mac(value) -> str | None:
+    if not value:
+        return None
+    text = str(value).replace("-", ":").upper()
+    parts = text.split(":")
+    if len(parts) == 6:
+        try:
+            return ":".join(f"{int(part, 16):02X}" for part in parts)
+        except ValueError:
+            return text
+    return text
+
+
+def _probe_sendarp(function, value: int, retries: int) -> tuple[str | None, int]:
     last_code = 0
     for attempt in range(retries + 1):
         mac = (ctypes.c_ubyte * 8)()
@@ -172,52 +265,52 @@ def _probe_sendarp(function, value: int, retries: int) -> tuple[bool, int]:
             )
         )
         if code == 0 and length.value >= 6 and any(mac[:6]):
-            return True, 0
+            return _format_mac(mac), 0
         last_code = code
         if code in _FATAL_CODES:
             raise ScanError(f"SendARP 返回错误码 {code}，扫描已中止")
         if attempt < retries:
             time.sleep(0.05)
-    return False, last_code
+    return None, last_code
 
 
-def _scan_sendarp(config: ScanConfig) -> ScanResult:
-    if sys.platform != "win32":
-        raise ScanError("SendARP 扫描后端仅支持 Windows")
-    function = _load_sendarp()
-    network = config.network
+def _scan_sendarp_network(
+    config: ScanConfig,
+    network: ipaddress.IPv4Network,
+    function,
+) -> tuple[dict[str, str], int, str]:
     source_ip = _route_source_ip(network)
-    _ensure_local_source(network, source_ip)
+    _ensure_local_source(network, source_ip, _local_ipv4_networks())
 
     hosts = [str(ip) for ip in network.hosts()]
     if not hosts:
-        return ScanResult(
-            online_ips=[],
-            duration_ms=0,
-            iface=f"SendARP ({source_ip})",
-            backend="sendarp",
-        )
+        return {}, 0, f"SendARP ({source_ip})"
 
     started = time.perf_counter()
     workers = min(128, max(len(hosts), 1))
-    online: list[str] = []
+    online: dict[str, str] = {}
     errors: dict[int, int] = {}
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(_probe_sendarp, function, _ip_to_sendarp_value(ip), config.retries): ip
+                pool.submit(
+                    _probe_sendarp,
+                    function,
+                    _ip_to_sendarp_value(ip),
+                    config.retries,
+                ): ip
                 for ip in hosts
             }
             for future in as_completed(futures):
                 address = futures[future]
                 try:
-                    alive, code = future.result()
+                    mac, code = future.result()
                 except ScanError:
                     raise
                 except Exception:
                     continue
-                if alive:
-                    online.append(address)
+                if mac:
+                    online[address] = mac
                 elif code:
                     errors[code] = errors.get(code, 0) + 1
     except ScanError:
@@ -239,11 +332,30 @@ def _scan_sendarp(config: ScanConfig) -> ScanResult:
                 "为避免误判已中止本次扫描"
             )
 
+    return online, duration_ms, f"SendARP ({source_ip})"
+
+
+def _scan_sendarp(config: ScanConfig) -> ScanResult:
+    if sys.platform != "win32":
+        raise ScanError("SendARP 扫描后端仅支持 Windows")
+    function = _load_sendarp()
+
+    online: dict[str, str] = {}
+    duration_ms = 0
+    interfaces: list[str] = []
+    for network in config.networks:
+        partial, partial_ms, iface = _scan_sendarp_network(config, network, function)
+        online.update(partial)
+        duration_ms += partial_ms
+        if iface not in interfaces:
+            interfaces.append(iface)
+
     return ScanResult(
         online_ips=sorted(online, key=ipaddress.ip_address),
         duration_ms=duration_ms,
-        iface=f"SendARP ({source_ip})",
+        iface=", ".join(interfaces),
         backend="sendarp",
+        mac_map=online,
     )
 
 
@@ -260,17 +372,20 @@ def _import_scapy():
     return ARP, Ether, conf, srp
 
 
-def _scan_scapy(config: ScanConfig) -> ScanResult:
-    network = config.network
-    ARP, Ether, conf, srp = _import_scapy()
-    conf.verb = 0
-
+def _scan_scapy_network(
+    config: ScanConfig,
+    network: ipaddress.IPv4Network,
+    ARP,
+    Ether,
+    conf,
+    srp,
+) -> tuple[dict[str, str], int, str]:
     try:
         iface, source_ip, _gateway = conf.route.route(str(network.network_address))
     except Exception as exc:
         raise ScanError(f"无法确定扫描网卡：{exc}") from exc
 
-    _ensure_local_source(network, source_ip)
+    _ensure_local_source(network, source_ip, _local_ipv4_networks())
 
     packet = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(network))
     started = time.perf_counter()
@@ -286,25 +401,54 @@ def _scan_scapy(config: ScanConfig) -> ScanResult:
         raise ScanError(f"ARP 扫描失败：{exc}") from exc
     duration_ms = int((time.perf_counter() - started) * 1000)
 
-    online: set[str] = set()
+    online: dict[str, str] = {}
     for _sent, received in answered:
         try:
             address = received[ARP].psrc
+            mac = received[ARP].hwsrc
         except Exception:
             address = getattr(received, "psrc", None)
+            mac = getattr(received, "hwsrc", None)
         if not address:
             continue
         try:
-            if ipaddress.ip_address(address) in network:
-                online.add(str(address))
+            if ipaddress.ip_address(address) not in network:
+                continue
         except ValueError:
             continue
+        normalized = _normalize_mac(mac)
+        if normalized:
+            online[str(address)] = normalized
+        else:
+            online.setdefault(str(address), "")
+
+    return online, duration_ms, str(iface)
+
+
+def _scan_scapy(config: ScanConfig) -> ScanResult:
+    ARP, Ether, conf, srp = _import_scapy()
+    conf.verb = 0
+
+    online: dict[str, str] = {}
+    duration_ms = 0
+    interfaces: list[str] = []
+    for network in config.networks:
+        partial, partial_ms, iface = _scan_scapy_network(
+            config, network, ARP, Ether, conf, srp
+        )
+        online.update({ip: mac for ip, mac in partial.items() if mac})
+        for ip in partial:
+            online.setdefault(ip, "")
+        duration_ms += partial_ms
+        if iface not in interfaces:
+            interfaces.append(iface)
 
     return ScanResult(
         online_ips=sorted(online, key=ipaddress.ip_address),
         duration_ms=duration_ms,
-        iface=str(iface),
+        iface=", ".join(interfaces),
         backend="scapy",
+        mac_map={ip: mac for ip, mac in online.items() if mac},
     )
 
 

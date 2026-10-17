@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.4.0"
+  #define MyAppVersion "0.5.0"
 #endif
 
 #define MyAppName "IP 活跃度审计"
@@ -71,6 +71,7 @@ const
     '; IP Activity Auditor 配置文件' + #13#10 +
     '; 相对路径以本配置文件所在目录为基准' + #13#10 +
     '; 仅允许扫描本文件中的 CIDR，请确保已获得网络扫描授权' + #13#10 +
+    '; 可填写多个网段，使用逗号、分号或换行分隔' + #13#10 +
     '' + #13#10 +
     '[scan]' + #13#10 +
     'cidr = 192.168.0.0/24' + #13#10 +

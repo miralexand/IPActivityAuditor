@@ -50,6 +50,7 @@ class DbReportTests(unittest.TestCase):
             scan_date=self.today.isoformat(),
             online_ips=online,
             duration_ms=123,
+            mac_map={"192.168.0.2": "AA:BB:CC:DD:EE:FF"},
         )
         rows = {row["ip_address"]: row for row in self.db.fetch_inventory(self.cidr)}
 
@@ -57,6 +58,10 @@ class DbReportTests(unittest.TestCase):
             self.assertEqual(rows[ip]["last_seen_date"], self.today.isoformat())
             self.assertEqual(rows[ip]["first_seen_date"], self.today.isoformat())
             self.assertEqual(rows[ip]["last_status"], "online")
+        self.assertEqual(
+            rows["192.168.0.2"]["mac_address"], "AA:BB:CC:DD:EE:FF"
+        )
+        self.assertIsNone(rows["192.168.0.10"]["mac_address"])
 
         self.assertIsNone(rows["192.168.0.3"]["last_seen_date"])
         self.assertEqual(rows["192.168.0.3"]["last_status"], "offline")
@@ -121,10 +126,18 @@ class DbReportTests(unittest.TestCase):
         )
         self.assertEqual(never_seen["last_seen_date"], "")
         self.assertEqual(never_seen["days_unused"], "")
+        self.assertEqual(never_seen["mac_address"], "")
+        self.assertEqual(never_seen["never_active"], "是")
         self.assertEqual(never_seen["status"], "从未活跃")
 
+        seen = next(
+            row for row in seven_rows if row["ip_address"] == "192.168.0.3"
+        )
+        self.assertEqual(seen["never_active"], "否")
+
         self.assertEqual(
-            seven_text.splitlines()[0], "ip_address,last_seen_date,days_unused,status"
+            seven_text.splitlines()[0],
+            "ip_address,last_seen_date,days_unused,mac_address,never_active,status",
         )
         self.assertEqual(seven_count, len(seven_rows))
         self.assertEqual(fifteen_count, len(fifteen_rows))

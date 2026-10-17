@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import logging
 import os
 import sys
@@ -106,10 +107,17 @@ def _record_failure(
 
 
 def _run_init(db: Database, cfg: AppConfig, logger: logging.Logger) -> None:
-    addresses = (str(ip) for ip in cfg.scan.network.hosts())
-    inserted = db.initialize_inventory(cfg.scan.cidr, addresses)
-    total = db.count_inventory(cfg.scan.cidr)
-    logger.info("库存初始化完成：网段 %s，新增 %d 个 IP，当前共 %d 个", cfg.scan.cidr, inserted, total)
+    inserted = 0
+    for network in cfg.scan.networks:
+        addresses = (str(ip) for ip in network.hosts())
+        inserted += db.initialize_inventory(str(network), addresses)
+    total = db.count_inventory(cfg.scan.cidrs)
+    logger.info(
+        "库存初始化完成：网段 %s，新增 %d 个 IP，当前共 %d 个",
+        cfg.scan.cidr,
+        inserted,
+        total,
+    )
 
 
 def _run_scan(
@@ -142,13 +150,24 @@ def _run_scan(
         return False
 
     try:
-        addresses = (str(ip) for ip in cfg.scan.network.hosts())
-        db.initialize_inventory(cfg.scan.cidr, addresses)
-        db.apply_scan_success(
-            cidr=cfg.scan.cidr,
+        groups: list[tuple[str, list[str]]] = []
+        for network in cfg.scan.networks:
+            cidr = str(network)
+            db.initialize_inventory(
+                cidr, (str(ip) for ip in network.hosts())
+            )
+            online = [
+                ip
+                for ip in result.online_ips
+                if ipaddress.ip_address(ip) in network
+            ]
+            groups.append((cidr, online))
+        db.apply_scan_success_multi(
+            groups=groups,
+            cidr_label=cfg.scan.cidr,
             scan_date=scan_date.isoformat(),
-            online_ips=result.online_ips,
             duration_ms=result.duration_ms,
+            mac_map=result.mac_map,
         )
     except Exception as exc:
         logger.exception("保存扫描结果失败")
@@ -176,7 +195,7 @@ def _run_reports(
 ) -> int:
     try:
         results = generate_reports(
-            db, cfg.report_dir, cfg.scan.cidr, scan_date, days_list
+            db, cfg.report_dir, cfg.scan.cidrs, scan_date, days_list
         )
     except Exception:
         logger.exception("生成报表失败")
@@ -231,7 +250,7 @@ def _execute(
                 return EXIT_SCAN_FAILED
 
             if "report" in actions:
-                if "scan" not in actions and db.count_inventory(cfg.scan.cidr) == 0:
+                if "scan" not in actions and db.count_inventory(cfg.scan.cidrs) == 0:
                     logger.warning("库存为空，请先运行 --init 或 --scan")
                 code = _run_reports(db, cfg, scan_date, days_list, logger)
                 if code != EXIT_OK:

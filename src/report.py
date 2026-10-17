@@ -4,10 +4,18 @@ import csv
 import ipaddress
 from datetime import date
 from pathlib import Path
+from typing import Sequence
 
 from db import Database
 
-CSV_HEADER = ["ip_address", "last_seen_date", "days_unused", "status"]
+CSV_HEADER = [
+    "ip_address",
+    "last_seen_date",
+    "days_unused",
+    "mac_address",
+    "never_active",
+    "status",
+]
 
 
 def natural_ip_key(value: str) -> tuple[int, object]:
@@ -20,21 +28,33 @@ def natural_ip_key(value: str) -> tuple[int, object]:
 def write_unused_report(
     db: Database,
     report_dir: Path,
-    cidr: str,
+    cidrs: str | Sequence[str],
     scan_date: date,
     days: int,
 ) -> tuple[Path, int]:
-    rows = db.fetch_unused(cidr, scan_date, days)
-    records: list[tuple[str, str, str, str]] = []
+    rows = db.fetch_unused(cidrs, scan_date, days)
+    records: list[tuple[str, str, str, str, str, str]] = []
     for row in rows:
         last_seen = row["last_seen_date"]
+        mac = row["mac_address"] or ""
         if last_seen is None:
             days_unused = ""
+            never_active = "是"
             status = "从未活跃"
         else:
             days_unused = str(max((scan_date - date.fromisoformat(last_seen)).days, 0))
+            never_active = "否"
             status = "未使用"
-        records.append((row["ip_address"], last_seen or "", days_unused, status))
+        records.append(
+            (
+                row["ip_address"],
+                last_seen or "",
+                days_unused,
+                mac,
+                never_active,
+                status,
+            )
+        )
 
     records.sort(key=lambda item: natural_ip_key(item[0]))
 
@@ -50,11 +70,11 @@ def write_unused_report(
 def generate_reports(
     db: Database,
     report_dir: Path,
-    cidr: str,
+    cidrs: str | Sequence[str],
     scan_date: date,
     days_list: tuple[int, ...] | list[int],
 ) -> list[tuple[Path, int]]:
     return [
-        write_unused_report(db, report_dir, cidr, scan_date, days)
+        write_unused_report(db, report_dir, cidrs, scan_date, days)
         for days in days_list
     ]
