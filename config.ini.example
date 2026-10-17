@@ -1,0 +1,20 @@
+; IP Activity Auditor 配置文件
+; 复制为 config.ini 后按实际环境修改
+; 相对路径以本配置文件所在目录为基准
+; 仅允许扫描本文件中的 CIDR，请确保已获得网络扫描授权
+
+[scan]
+cidr = 192.168.0.0/24
+backend = auto
+timeout_ms = 1500
+retries = 1
+
+[storage]
+db_path = data/ip_activity.db
+
+[report]
+report_dir = reports
+unused_days = 7,15
+
+[log]
+log_dir = logs

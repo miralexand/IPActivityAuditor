@@ -1,0 +1,198 @@
+以下技术目标可直接复制给 vibe coding 使用。
+
+> 更新说明：后续需求已增加“现代化图形界面”“安装版 + 便携版”，并保留原有命令行/任务计划能力。默认扫描后端已改为 Windows 原生 SendARP，不再依赖 Npcap；Scapy 仍作为可选后端。最新使用说明以 README.md 为准；本文件中的“不做 GUI”“需安装 Npcap”条目已不再适用。
+
+---
+
+# 技术目标：内网IP活跃度审计工具（IP Activity Auditor）
+
+## 1. 项目背景与目标
+
+医院内网使用 `192.168.0.0/24` 网段。需要开发一个 Windows 可执行程序 `IPActivityAuditor.exe`，每天自动运行一次，扫描指定内网网段中在线 IP，记录每个 IP 的最后活跃日期，并生成“7 天未使用”和“15 天未使用”的 IP 清单报表。
+
+项目目标：
+- 每日无人值守扫描一次；
+- 使用 SQLite 保存 IP 活跃历史；
+- 生成 CSV 报表，便于 Excel 打开；
+- 打包为单个 exe，通过 Windows 任务计划程序每天定时运行；
+- 扫描失败时不得误判 IP 为未使用。
+
+## 2. 技术栈约束
+
+- 语言：Python 3.11+
+- 扫描：Scapy，使用 ARP 请求扫描
+- 存储：SQLite，Python 标准库 `sqlite3`
+- 报表：CSV，编码 `utf-8-sig`
+- 打包：PyInstaller，单文件 exe
+- 定时：Windows 任务计划程序
+- 运行平台：Windows 10/11
+- 运行权限：管理员权限
+- 运行依赖：目标机器需安装 Npcap，并启用 WinPcap 兼容模式
+- 不引入 Web 服务、不引入 MySQL/PostgreSQL、不做 GUI
+
+## 3. 功能需求
+
+### 3.1 配置
+
+使用 `config.ini`，至少包含：
+
+```ini
+[scan]
+cidr = 192.168.0.0/24
+timeout_ms = 1500
+retries = 1
+
+[storage]
+db_path = data/ip_activity.db
+
+[report]
+report_dir = reports
+unused_days = 7,15
+
+[log]
+log_dir = logs
+```
+
+要求：
+- 只允许扫描配置中的 CIDR；
+- 不得自动扩展网段；
+- 不得扫描未授权网段；
+- 首次运行自动创建数据库、目录和表。
+
+### 3.2 命令行
+
+exe 支持以下用法：
+
+```powershell
+IPActivityAuditor.exe --config config.ini
+IPActivityAuditor.exe --scan
+IPActivityAuditor.exe --report --days 7,15
+IPActivityAuditor.exe --init
+```
+
+默认无参数时执行：`--scan` + 生成 7 天和 15 天报表。
+
+### 3.3 每日扫描逻辑
+
+1. 检查管理员权限；无权限则记录错误并以非 0 退出。
+2. 读取配置，解析 CIDR。
+3. 首次运行时，将 CIDR 内所有可用 IP 初始化到 `ip_inventory` 表，`last_seen_date` 为空。
+4. 使用 Scapy 发送 ARP 请求扫描整个 CIDR：
+   - 目的 MAC：`ff:ff:ff:ff:ff:ff`
+   - 超时和重试读取配置
+   - 只统计有 ARP 响应的 IP
+5. 扫描成功后：
+   - 对在线 IP，更新 `last_seen_date = 今天`，更新 `last_status = online`；
+   - 对未在线 IP，不修改 `last_seen_date`；
+   - 写入 `scan_runs` 表记录本次扫描日期、CIDR、在线数量、耗时、状态。
+6. 扫描失败或异常时：
+   - 只写入失败日志和 `scan_runs.error`；
+   - **不得更新任何 IP 的 `last_seen_date`**；
+   - 以非 0 退出，避免把扫描故障误判为“未使用”。
+
+### 3.4 未使用判断规则
+
+以扫描当天日期 `D` 为基准：
+
+```sql
+未使用 N 天：
+last_seen_date IS NULL
+OR last_seen_date <= date(D, '-N days')
+```
+
+说明：
+- `last_seen_date IS NULL` 表示从未扫描到活跃；
+- 报表中应包含“从未活跃”的 IP；
+- 报表字段：`ip_address, last_seen_date, days_unused, status`；
+- 按 IP 地址自然排序；
+- 输出文件：
+  - `reports/IP未使用清单_7天_YYYYMMDD.csv`
+  - `reports/IP未使用清单_15天_YYYYMMDD.csv`
+
+### 3.5 数据库设计
+
+至少包含两张表：
+
+```sql
+CREATE TABLE IF NOT EXISTS ip_inventory (
+    ip_address TEXT PRIMARY KEY,
+    first_seen_date TEXT,
+    last_seen_date TEXT,
+    last_status TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS scan_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_date TEXT NOT NULL,
+    cidr TEXT NOT NULL,
+    online_count INTEGER DEFAULT 0,
+    duration_ms INTEGER DEFAULT 0,
+    status TEXT NOT NULL,
+    error TEXT
+);
+```
+
+可选增加 `daily_online(scan_date, ip_address)` 表，用于保留每日在线历史，便于审计。MVP 可先不实现。
+
+### 3.6 日志
+
+- 日志目录：`logs/`
+- 日志文件：`ip_activity_auditor.log`
+- 使用 `logging`，支持按大小轮转；
+- 记录启动、配置、扫描开始、扫描结果、报表生成、异常、退出码；
+- 控制台和日志文件均输出摘要。
+
+## 4. 非功能需求
+
+- 单次 `/24` 扫描时间控制在合理范围，默认超时 1.5 秒，重试 1 次；
+- 不得高频循环发送 ARP；
+- exe 可独立运行，不要求目标机器安装 Python；
+- 报表 CSV 必须能被 Excel 正确打开，中文不乱码；
+- 代码结构清晰，便于后续扩展到多个网段；
+- 所有网络操作仅限配置的 CIDR；
+- README 中写明授权使用、管理员权限、Npcap 依赖和任务计划配置方法。
+
+## 5. 交付物
+
+1. 源码：
+   - `src/main.py`
+   - `src/config.py`
+   - `src/scanner.py`
+   - `src/db.py`
+   - `src/report.py`
+2. `requirements.txt`
+3. `config.ini.example`
+4. `README.md`
+5. `build.ps1`：PyInstaller 打包脚本
+6. 打包产物：`dist/IPActivityAuditor.exe`
+7. 可选：`install_task.ps1`，用于创建每日任务计划，任务需勾选“使用最高权限运行”
+
+建议 PyInstaller 命令：
+
+```powershell
+pyinstaller --onefile --name IPActivityAuditor --collect-all scapy src/main.py
+```
+
+## 6. 验收标准
+
+1. 在测试网段运行 `--init` 后，数据库中存在该网段所有可用 IP，`last_seen_date` 为空。
+2. 有设备在线时运行 `--scan`，在线 IP 的 `last_seen_date` 更新为当天。
+3. 断开某设备后，将数据库该 IP 的 `last_seen_date` 手工改为 8 天前，运行报表，该 IP 出现在 7 天未使用清单中，但不出现在 15 天清单中。
+4. 将某 IP 的 `last_seen_date` 改为 16 天前，该 IP 同时出现在 7 天和 15 天清单中。
+5. 从未活跃 IP 出现在报表中，`last_seen_date` 为空。
+6. 模拟扫描失败时，`ip_inventory.last_seen_date` 不被修改，程序退出码非 0。
+7. `IPActivityAuditor.exe` 在未安装 Python 的 Windows 机器上可运行，但需安装 Npcap。
+8. 任务计划程序每天低峰期自动运行 exe，生成当天日志和报表。
+
+## 7. 给 AI 编码的约束
+
+- 先实现 MVP，不要过度设计；
+- 不要引入 Web 框架、ORM、外部数据库；
+- 不要实现图形界面；
+- 不要自动修改防火墙或系统网络配置；
+- 扫描范围必须严格来自配置；
+- 扫描失败不得更新活跃日期；
+- 所有日期使用本地时区，格式 `YYYY-MM-DD`；
+- 代码需包含基本异常处理和明确退出码；
+- 完成后给出运行示例、打包命令和任务计划配置说明。
