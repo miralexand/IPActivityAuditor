@@ -7,6 +7,16 @@
 
 > **授权使用声明**：本工具仅可用于你拥有管理权限、且已获得明确授权的内网。程序只扫描 `config.ini` 中配置的 CIDR，不会自动扩展网段。请勿用于未经授权的网络探测。
 
+## 宣传视频
+
+[![IP Activity Auditor 宣传视频封面](media/ipaa-promo-poster.jpg)](media/IPActivityAuditor-promo-15s.mp4)
+
+15 秒快节奏动态图形短片，展示多网段扫描、MAC 审计、内置报表、日志查询和托盘静默运行。
+
+- [播放 / 下载 MP4](media/IPActivityAuditor-promo-15s.mp4)
+- [查看分镜预览](media/ipaa-promo-contact-sheet.jpg)
+- 生成脚本：`tools/make_promo_video.py`
+
 ## 功能亮点
 
 - **多网段扫描**：一个配置中可填写多个 CIDR，逐网段探测并汇总结果
