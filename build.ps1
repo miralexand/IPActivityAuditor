@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [switch]$SkipInstall,
-    [switch]$SkipInstaller
+    [switch]$SkipInstaller,
+    [string]$PythonExe
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,24 +10,36 @@ Set-Location -LiteralPath $PSScriptRoot
 
 $script:pyExe = $null
 $script:pyArgs = @()
-$candidates = @(
-    @{ Exe = "py"; Args = @("-3.11") },
-    @{ Exe = "py"; Args = @("-3") },
-    @{ Exe = "python"; Args = @() }
-)
-foreach ($candidate in $candidates) {
-    if (-not (Get-Command $candidate.Exe -ErrorAction SilentlyContinue)) {
-        continue
+if ($PythonExe) {
+    if (-not (Get-Command $PythonExe -ErrorAction SilentlyContinue)) {
+        throw "Python executable not found: $PythonExe"
     }
-    $probe = @($candidate.Args) + @(
-        "-c",
-        "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"
+    & $PythonExe -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Specified Python is not 3.11+: $PythonExe"
+    }
+    $script:pyExe = $PythonExe
+}
+else {
+    $candidates = @(
+        @{ Exe = "py"; Args = @("-3.11") },
+        @{ Exe = "py"; Args = @("-3") },
+        @{ Exe = "python"; Args = @() }
     )
-    & $candidate.Exe @probe 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        $script:pyExe = $candidate.Exe
-        $script:pyArgs = @($candidate.Args)
-        break
+    foreach ($candidate in $candidates) {
+        if (-not (Get-Command $candidate.Exe -ErrorAction SilentlyContinue)) {
+            continue
+        }
+        $probe = @($candidate.Args) + @(
+            "-c",
+            "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"
+        )
+        & $candidate.Exe @probe 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $script:pyExe = $candidate.Exe
+            $script:pyArgs = @($candidate.Args)
+            break
+        }
     }
 }
 if (-not $script:pyExe) {

@@ -1,5 +1,7 @@
 # 内网 IP 活跃度审计工具（IP Activity Auditor）
 
+[![Build](https://github.com/miralexand/IPActivityAuditor/actions/workflows/build.yml/badge.svg)](https://github.com/miralexand/IPActivityAuditor/actions/workflows/build.yml)
+
 通过 ARP 扫描指定内网网段，记录每个 IP 的最后活跃日期，并生成“7 天未使用”“15 天未使用”的 CSV 清单。提供现代化图形界面，同时保留完整的命令行模式，适合人工巡检与任务计划无人值守运行。
 
 > **授权使用声明**：本工具仅可用于你拥有管理权限、且已获得明确授权的内网。程序只扫描 `config.ini` 中的 CIDR，不会自动扩展网段。请勿用于未经授权的网络探测。
@@ -288,11 +290,28 @@ py -3.11 -m pip install -r requirements.txt
 可选参数：
 
 ```powershell
-.\build.ps1 -SkipInstall      # 跳过 pip install
-.\build.ps1 -SkipInstaller    # 只构建 exe 和便携版
+.\build.ps1 -SkipInstall                  # 跳过 pip install
+.\build.ps1 -SkipInstaller                # 只构建 exe 和便携版
+.\build.ps1 -SkipInstall -PythonExe python  # 指定 Python（CI 常用）
 ```
 
 构建安装版需要安装 [Inno Setup 6](https://jrsoftware.org/isinfo.php)。脚本会自动查找常见安装路径，也可通过 `winget install JRSoftware.InnoSetup` 安装。
+
+### GitHub Actions 自动构建
+
+工作流文件：`.github/workflows/build.yml`
+
+- 推送到 `main`、提交 PR 或手动触发时：运行 16 项测试，构建 exe、便携版 ZIP 和安装版，并上传为 Actions Artifacts
+- 推送 `v*` 标签时：自动创建 GitHub Release 并附加三个构建产物
+
+发布新版本：
+
+```powershell
+git tag v0.4.0
+git push origin v0.4.0
+```
+
+> `dist/` 已被 `.gitignore` 排除，构建产物通过 Actions Artifacts 或 GitHub Release 分发，不进入源码仓库。
 
 ### 手动构建
 
@@ -304,6 +323,7 @@ py -3.11 -m PyInstaller --noconfirm --clean --onefile --console --hide-console h
   --add-data "assets;assets" `
   --collect-all scapy `
   --collect-all customtkinter `
+  --collect-all pystray `
   src\main.py
 ```
 
@@ -396,6 +416,9 @@ py -3.11 -m unittest discover -s tests -v
 
 ```text
 IPAA/
+├─ .github/
+│  └─ workflows/
+│     └─ build.yml       # GitHub Actions 自动构建与 Release
 ├─ src/
 │  ├─ main.py            # 入口、CLI/GUI 分发、日志、流程编排
 │  ├─ gui.py             # 现代化图形界面
