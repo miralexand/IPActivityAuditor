@@ -74,7 +74,12 @@ class ScannerBackendTests(unittest.TestCase):
             return 0
 
         with mock.patch.object(scanner, "_load_sendarp", return_value=fake_sendarp), \
-             mock.patch.object(scanner, "_route_source_ip", return_value="192.168.0.1"):
+             mock.patch.object(scanner, "_route_source_ip", return_value="192.168.0.1"), \
+             mock.patch.object(
+                 scanner,
+                 "_local_ipv4_networks",
+                 return_value=[ipaddress.ip_network("192.168.0.0/24")],
+             ):
             result = _scan_sendarp(make_config("sendarp"))
 
         self.assertEqual(result.backend, "sendarp")
@@ -130,7 +135,12 @@ class ScannerBackendTests(unittest.TestCase):
             return 87
 
         with mock.patch.object(scanner, "_load_sendarp", return_value=fake_sendarp), \
-             mock.patch.object(scanner, "_route_source_ip", return_value="192.168.0.1"):
+             mock.patch.object(scanner, "_route_source_ip", return_value="192.168.0.1"), \
+             mock.patch.object(
+                 scanner,
+                 "_local_ipv4_networks",
+                 return_value=[ipaddress.ip_network("192.168.0.0/24")],
+             ):
             with self.assertRaises(ScanError):
                 _scan_sendarp(make_config("sendarp"))
 
